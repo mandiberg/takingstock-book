@@ -53,6 +53,8 @@ FOOTER_FONT_FILE = os.path.join(GLOBAL_PATH, "fonts/IBMPlexMono-SemiBold.ttf")
 FOOTER_FONT_NAME = "IBMPlexMono-SemiBold"
 PAGE_SIZE   = [20*cm, 30*cm]  # 20cm × 30cm (ReportLab uses points; cm converts to pt)
 
+QUALITY = 95  # JPEG quality for CMYK images (0-100)
+
 # Toggle prepress marks/bleed canvas on or off.
 ENABLE_BLEED_AND_CROPS = True
 
@@ -93,7 +95,7 @@ words_without_pos_list = []
 SIDE = "left"
 
 #batch Processing
-BATCH_PROCESS = False
+BATCH_PROCESS = True
 PROCESS_SELECT = [18,19]
 CSV_LIST = {}
 
@@ -352,7 +354,7 @@ def save_cmyk_jpeg_from_wordcloud(wc, csv_number, cmyk_transform, icc_profile_pa
     cmyk_image.save(
         cmyk_path,
         format="JPEG",
-        quality=100,
+        quality=QUALITY,
         subsampling=0,
         icc_profile=icc_bytes,
     )
