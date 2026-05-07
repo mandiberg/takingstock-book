@@ -1,20 +1,28 @@
 """
 make_wordcloud_pdf.py
 Tench Cholnoky · macOS Sequoia 15.5 · Python 3.10
+
+requires the gensim conda env - gensim311 for MM
 """
 
-import os, tempfile, math
+import os, tempfile, math, datetime
 import pandas as pd
 import random
 import numpy as np
 import csv
 from wordcloud import WordCloud                          
+from PIL import ImageCms
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 from reportlab.lib.units import cm
 from pick import pick
+
+try:
+    import pikepdf
+except ImportError:
+    pikepdf = None
 
 
 import gensim
@@ -24,7 +32,7 @@ from nltk.stem import WordNetLemmatizer, SnowballStemmer
 # ---------- CONFIG -----------------------------------------------------------
 
 GLOBAL_PATH = os.path.dirname(os.path.abspath(__file__))
-TAKINGSTOCK_PATH = os.path.join(os.path.dirname(GLOBAL_PATH), 'takingstock/')
+TAKINGSTOCK_PATH = os.path.join(os.path.dirname(GLOBAL_PATH), 'facemap/')
 
 INPUT_PATH  = os.path.join(GLOBAL_PATH, "input_csvs/word_cloud/")
 MODEL_PATH =  os.path.join(GLOBAL_PATH, "model/")
@@ -33,6 +41,7 @@ OUTPUT_PATH = os.path.join(GLOBAL_PATH, 'outputs/word_cloud/')
 PASSED_WORDS_POS_FILE = os.path.join(GLOBAL_PATH, "passed_words_pos.csv")
 STOPWORD_DF_PATH = os.path.join(GLOBAL_PATH, "topic_word_stopword.csv")
 FOOTER_FILE = os.path.join(GLOBAL_PATH, "footers.csv")
+ICC_PROFILE_PATH = os.path.join(GLOBAL_PATH, "printing/PSOcoated_v3.icc")
 
 # print(f"Paths: Input: {INPUT_PATH}, Model: {MODEL_PATH}, Stopwords: {STOPWORD_PATH}, Output: {OUTPUT_PATH}")
 
@@ -43,6 +52,20 @@ FONT_FILE   = os.path.join(GLOBAL_PATH, "fonts/Cardo.ttf")
 FOOTER_FONT_FILE = os.path.join(GLOBAL_PATH, "fonts/IBMPlexMono-SemiBold.ttf")
 FOOTER_FONT_NAME = "IBMPlexMono-SemiBold"
 PAGE_SIZE   = [20*cm, 30*cm]  # 20cm × 30cm (ReportLab uses points; cm converts to pt)
+
+QUALITY = 95  # JPEG quality for CMYK images (0-100)
+
+# Toggle prepress marks/bleed canvas on or off.
+ENABLE_BLEED_AND_CROPS = True
+
+# Prepress: bleed, crop marks, slug (all in points; 1 mm = 72/25.4 pt)
+_MM          = 72 / 25.4
+BLEED        = 3  * _MM   # 3 mm bleed all sides
+MARK_OFFSET  = 5  * _MM   # 5 mm from bleed edge to near end of mark
+MARK_LENGTH  = 3  * _MM   # 3 mm long crop marks
+MARK_WEIGHT  = 0.125       # pt stroke weight
+SLUG         = (BLEED + MARK_OFFSET + MARK_LENGTH) if ENABLE_BLEED_AND_CROPS else 0
+CANVAS_SIZE  = [PAGE_SIZE[0] + 2 * SLUG, PAGE_SIZE[1] + 2 * SLUG]
 
 # Scale factor: original page was 432×648 pt (6×9"); new is 20×30cm. Scale ≈ 1.31.
 _ORIG_PAGE_WIDTH = 432
@@ -73,7 +96,7 @@ SIDE = "left"
 
 #batch Processing
 BATCH_PROCESS = True
-PROCESS_SELECT = [57]
+PROCESS_SELECT = [18,19]
 CSV_LIST = {}
 
 #cutoff for how many rows of the CSV to add to the textcloud
@@ -133,6 +156,10 @@ print(f"POS_COLOR_VERB is {POS_COLOR_VERB}")
 print(f"POS_COLOR_OTHER is {POS_COLOR_OTHER}")
 
 OUT_PDF     = os.path.join(OUTPUT_PATH, f"wordcloud_FULL_BATCH_{BATCH_PROCESS}_GRAY_{STOPWORD_COLOR}")  # final file
+CMYK_ASSET_PATH = os.path.join(OUTPUT_PATH, "cmyk")
+COLOR_MANAGED_CMYK = True
+OUTPUT_INTENT_IDENTIFIER = "PSO Coated v3"
+OUTPUT_INTENT_INFO = "PSO Coated v3 (FOGRA51)"
 
 # Scaling configuration
 SCALE_BUCKETS = [
@@ -292,6 +319,146 @@ def compute_global_scale(all_freqs_dicts, use_log_scale=False):
 def _clamp(value, min_value=0.0, max_value=1.0):
     """Clamp a numeric value into [min_value, max_value]."""
     return max(min_value, min(max_value, value))
+
+
+def ensure_output_paths():
+    os.makedirs(OUTPUT_PATH, exist_ok=True)
+    if COLOR_MANAGED_CMYK:
+        os.makedirs(CMYK_ASSET_PATH, exist_ok=True)
+
+
+def get_cmyk_transform(icc_profile_path):
+    if not os.path.exists(icc_profile_path):
+        raise FileNotFoundError(f"ICC profile not found: {icc_profile_path}")
+
+    srgb_profile = ImageCms.createProfile("sRGB")
+    cmyk_profile = ImageCms.getOpenProfile(icc_profile_path)
+    transform = ImageCms.buildTransformFromOpenProfiles(
+        srgb_profile,
+        cmyk_profile,
+        "RGB",
+        "CMYK",
+        renderingIntent=0,
+    )
+    return transform
+
+
+def save_cmyk_jpeg_from_wordcloud(wc, csv_number, cmyk_transform, icc_profile_path):
+    rgb_image = wc.to_image().convert("RGB")
+    cmyk_image = ImageCms.applyTransform(rgb_image, cmyk_transform)
+    cmyk_path = os.path.join(CMYK_ASSET_PATH, f"topic_{csv_number}_cmyk.jpg")
+
+    with open(icc_profile_path, "rb") as f:
+        icc_bytes = f.read()
+
+    cmyk_image.save(
+        cmyk_path,
+        format="JPEG",
+        quality=QUALITY,
+        subsampling=0,
+        icc_profile=icc_bytes,
+    )
+    return cmyk_path, cmyk_image.size
+
+
+def draw_print_marks(c, page_info_label, page_num):
+    """Draw crop marks and slug info text outside the trim area per printer spec."""
+    tw = PAGE_SIZE[0]
+    th = PAGE_SIZE[1]
+    s  = SLUG
+    b  = BLEED
+    mo = MARK_OFFSET
+    ml = MARK_LENGTH
+
+    c.saveState()
+    c.setLineWidth(MARK_WEIGHT)
+    c.setStrokeColorRGB(0, 0, 0)
+    c.setFillColorRGB(0, 0, 0)
+
+    # Horizontal marks (indicate left/right trim edges at each corner)
+    lx1 = s - b - mo - ml
+    lx2 = s - b - mo
+    rx1 = s + tw + b + mo
+    rx2 = s + tw + b + mo + ml
+
+    # Vertical marks (indicate top/bottom trim edges at each corner)
+    by1 = s - b - mo - ml
+    by2 = s - b - mo
+    ty1 = s + th + b + mo
+    ty2 = s + th + b + mo + ml
+
+    # Bottom-left corner
+    c.line(lx1, s, lx2, s)
+    c.line(s, by1, s, by2)
+    # Bottom-right corner
+    c.line(rx1, s, rx2, s)
+    c.line(s + tw, by1, s + tw, by2)
+    # Top-left corner
+    c.line(lx1, s + th, lx2, s + th)
+    c.line(s, ty1, s, ty2)
+    # Top-right corner
+    c.line(rx1, s + th, rx2, s + th)
+    c.line(s + tw, ty1, s + tw, ty2)
+
+    # Slug info line: filename | page | topic | date
+    now = datetime.datetime.now().strftime("%Y-%m-%d")
+    slug_text = f"{os.path.basename(OUT_PDF)}  |  p.{page_num}  |  {page_info_label}  |  {now}"
+    info_size = 5  # pt
+    c.setFont(FOOTER_FONT_NAME, info_size)
+    info_x = s
+    info_y = by1 - info_size * 2
+    c.drawString(info_x, info_y, slug_text)
+
+    c.restoreState()
+
+
+def embed_output_intent(pdf_path, icc_profile_path):
+    if pikepdf is None:
+        print("WARNING: pikepdf is not installed; skipping OutputIntent embedding.")
+        return
+
+    if not os.path.exists(icc_profile_path):
+        print(f"WARNING: ICC profile not found at {icc_profile_path}; skipping OutputIntent embedding.")
+        return
+
+    with open(icc_profile_path, "rb") as f:
+        icc_bytes = f.read()
+
+    with pikepdf.Pdf.open(pdf_path, allow_overwriting_input=True) as pdf:
+        icc_stream = pdf.make_stream(icc_bytes)
+        icc_stream[pikepdf.Name("/N")] = 4
+        icc_stream[pikepdf.Name("/Alternate")] = pikepdf.Name("/DeviceCMYK")
+
+        output_intent = pdf.make_indirect(
+            pikepdf.Dictionary(
+                {
+                    "/Type": pikepdf.Name("/OutputIntent"),
+                    "/S": pikepdf.Name("/GTS_PDFX"),
+                    "/OutputConditionIdentifier": OUTPUT_INTENT_IDENTIFIER,
+                    "/Info": OUTPUT_INTENT_INFO,
+                    "/RegistryName": "https://www.color.org",
+                    "/DestOutputProfile": icc_stream,
+                }
+            )
+        )
+
+        pdf.Root["/OutputIntents"] = pikepdf.Array([output_intent])
+
+        # Set TrimBox always; set BleedBox only when bleed/crops are enabled.
+        for page in pdf.pages:
+            page["/TrimBox"] = pikepdf.Array([
+                SLUG, SLUG,
+                SLUG + PAGE_SIZE[0], SLUG + PAGE_SIZE[1],
+            ])
+            if ENABLE_BLEED_AND_CROPS:
+                page["/BleedBox"] = pikepdf.Array([
+                    SLUG - BLEED, SLUG - BLEED,
+                    SLUG + PAGE_SIZE[0] + BLEED, SLUG + PAGE_SIZE[1] + BLEED,
+                ])
+
+        pdf.save(pdf_path)
+
+    print(f"Embedded OutputIntent profile into PDF: {icc_profile_path}")
 
 
 def get_pos_color(word):
@@ -581,6 +748,15 @@ def get_all_topics_words(lda_model):
 
 
 all_topics_words = get_all_topics_words(lda_model_tfidf)
+ensure_output_paths()
+cmyk_transform = None
+if COLOR_MANAGED_CMYK:
+    try:
+        cmyk_transform = get_cmyk_transform(ICC_PROFILE_PATH)
+        print(f"Loaded CMYK transform using ICC profile: {ICC_PROFILE_PATH}")
+    except Exception as exc:
+        print(f"WARNING: Could not initialize CMYK transform ({exc}). Continuing without CMYK conversion.")
+        cmyk_transform = None
 
 # ---------- FIRST PASS: Collect all frequencies for global scaling ----------
 print("First pass: Collecting frequencies for global scaling...")
@@ -845,10 +1021,23 @@ for csv_data in csv_data_list:
         .generate_from_frequencies(wordcloud_freqs)
     )
 
-    # Save to a temp PNG
+    # Save both a permanent PNG at native size and a temp PNG for PDF embedding.
+    topic_png_path = os.path.join(OUTPUT_PATH, f"topic_{CSV_NUMBER}.png")
+    wc.to_file(topic_png_path)
     tmp_png = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
     wc.to_file(tmp_png.name)
-    print(f"  Topic {CSV_NUMBER} - Word cloud generated and saved to {tmp_png.name}")
+    cmyk_jpg_path = None
+    cmyk_image_size = None
+    if cmyk_transform is not None:
+        cmyk_jpg_path, cmyk_image_size = save_cmyk_jpeg_from_wordcloud(
+            wc,
+            CSV_NUMBER,
+            cmyk_transform,
+            ICC_PROFILE_PATH,
+        )
+        print(f"  Topic {CSV_NUMBER} - CMYK JPEG saved to {cmyk_jpg_path}")
+    print(f"  Topic {CSV_NUMBER} - Word cloud generated and saved to {topic_png_path}")
+    print(f"  Topic {CSV_NUMBER} - Temporary PDF source saved to {tmp_png.name}")
 
     # Store the word cloud data for later PDF creation
     PDF_DATA[CSV_NUMBER] = {
@@ -856,6 +1045,9 @@ for csv_data in csv_data_list:
         'max_font_size': topic_max_font_size,  # Store the max font size used
         'global_proportion': global_proportion,  # Store the global proportion
         'relations': relations,
+        'topic_png': topic_png_path,
+        'cmyk_jpg': cmyk_jpg_path,
+        'cmyk_size': cmyk_image_size,
         'tmp_png': tmp_png.name,
         'wc': wc,
         'keyword_list': keyword_list,
@@ -878,7 +1070,7 @@ pdfmetrics.registerFont(TTFont(FOOTER_FONT_NAME, FOOTER_FONT_FILE))
 
 # Create the final PDF
 final_pdf_path = OUT_PDF + '.pdf'
-c = canvas.Canvas(final_pdf_path, pagesize=PAGE_SIZE)
+c = canvas.Canvas(final_pdf_path, pagesize=CANVAS_SIZE)
 
 # Load footer data from CSV
 footer_lookup = {}
@@ -929,6 +1121,8 @@ for csv in CSV_LIST:
     data = PDF_DATA[CSV_NUMBER]
     tmp_png = data['tmp_png']
     wc = data['wc']
+    cmyk_jpg = data.get('cmyk_jpg')
+    cmyk_size = data.get('cmyk_size')
     
     # Calculate margins based on current side
     if current_side == "left":
@@ -943,8 +1137,12 @@ for csv in CSV_LIST:
     available_height = PAGE_SIZE[1] - TOP_MARGIN - BOTTOM_MARGIN
     
     # Load image
-    img = ImageReader(tmp_png)
-    img_width, img_height = wc.to_image().size
+    if cmyk_jpg:
+        img = ImageReader(cmyk_jpg)
+        img_width, img_height = cmyk_size
+    else:
+        img = ImageReader(tmp_png)
+        img_width, img_height = wc.to_image().size
     
     # Calculate scale to fit within available space
     scale_x = available_width / img_width
@@ -955,10 +1153,10 @@ for csv in CSV_LIST:
     draw_w = img_width * scale
     draw_h = img_height * scale
     
-    # Calculate position (centered within available space)
-    x = left_margin + (available_width - draw_w) / 2
-    y = BOTTOM_MARGIN + (available_height - draw_h) / 2
-    
+    # Calculate position (centered within trim area, offset by slug for bleed/marks)
+    x = SLUG + left_margin + (available_width - draw_w) / 2
+    y = SLUG + BOTTOM_MARGIN + (available_height - draw_h) / 2
+
     # Draw the word cloud
     c.drawImage(img, x, y, width=draw_w, height=draw_h, mask="auto")
     
@@ -981,26 +1179,28 @@ for csv in CSV_LIST:
     FOOTER_INSET = int(0.125 * 72)  # 1/8 inch in points
 
     if current_side == "left":
-        footer_x = left_margin + FOOTER_INSET  # Left-aligned + 1/8" inset
+        footer_x = SLUG + left_margin + FOOTER_INSET
     else:
-        footer_x = PAGE_SIZE[0] - right_margin - c.stringWidth(footer_text, FOOTER_FONT_NAME, FOOTER_FONT_SIZE) - FOOTER_INSET  # Right-aligned - 1/8" inset
-  
-    
+        footer_x = SLUG + PAGE_SIZE[0] - right_margin - c.stringWidth(footer_text, FOOTER_FONT_NAME, FOOTER_FONT_SIZE) - FOOTER_INSET
+
     # Footer text vertically centered in bottom margin (using font ascent/descent)
     ascent_pt = pdfmetrics.getAscent(FOOTER_FONT_NAME) * FOOTER_FONT_SIZE / 1000
     descent_pt = pdfmetrics.getDescent(FOOTER_FONT_NAME) * FOOTER_FONT_SIZE / 1000  # negative
     text_center_offset = (ascent_pt + descent_pt) / 2
-    footer_y = BOTTOM_MARGIN / 2 - text_center_offset + FOOTER_NUDGE
+    footer_y = SLUG + BOTTOM_MARGIN / 2 - text_center_offset + FOOTER_NUDGE
     c.drawString(footer_x, footer_y, footer_text)
     c.restoreState()
     
+    if ENABLE_BLEED_AND_CROPS:
+        draw_print_marks(c, footer_text, page_number)
     c.showPage()
-    
+
     # Toggle side for next page
     current_side = "right" if current_side == "left" else "left"
     page_number += 1
 
 c.save()
+embed_output_intent(final_pdf_path, ICC_PROFILE_PATH)
 print(f"✅ Final word-cloud PDF created → {final_pdf_path}")
 
 # Clean up temporary files
