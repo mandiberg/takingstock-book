@@ -55,6 +55,9 @@ PAGE_SIZE   = [20*cm, 30*cm]  # 20cm × 30cm (ReportLab uses points; cm converts
 
 QUALITY = 95  # JPEG quality for CMYK images (0-100)
 
+# Explicit CMYK black for all vector/text elements in the PDF.
+CMYK_BLACK = (0, 0, 0, 1)
+
 # Toggle prepress marks/bleed canvas on or off.
 ENABLE_BLEED_AND_CROPS = True
 
@@ -372,8 +375,8 @@ def draw_print_marks(c, page_info_label, page_num):
 
     c.saveState()
     c.setLineWidth(MARK_WEIGHT)
-    c.setStrokeColorRGB(0, 0, 0)
-    c.setFillColorRGB(0, 0, 0)
+    c.setStrokeColorCMYK(*CMYK_BLACK)
+    c.setFillColorCMYK(*CMYK_BLACK)
 
     # Horizontal marks (indicate left/right trim edges at each corner)
     lx1 = s - b - mo - ml
@@ -1137,7 +1140,11 @@ for csv in CSV_LIST:
     available_height = PAGE_SIZE[1] - TOP_MARGIN - BOTTOM_MARGIN
     
     # Load image
-    if cmyk_jpg:
+    if COLOR_MANAGED_CMYK:
+        if not cmyk_jpg:
+            raise RuntimeError(
+                f"CMYK mode is enabled but no CMYK asset exists for topic {CSV_NUMBER}."
+            )
         img = ImageReader(cmyk_jpg)
         img_width, img_height = cmyk_size
     else:
@@ -1163,6 +1170,7 @@ for csv in CSV_LIST:
     # Add footer
     c.saveState()
     c.setFont(FOOTER_FONT_NAME, FOOTER_FONT_SIZE)
+    c.setFillColorCMYK(*CMYK_BLACK)
     print("CSV_NUMBER", CSV_NUMBER)
     # Get footer data from CSV lookup
     footer_data = footer_lookup.get(CSV_NUMBER, {})
